@@ -11,6 +11,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .schemas import (
+    BatchVerifyRequest,
+    BatchVerifyResponse,
     CancelOut,
     CancelRequest,
     LicenseCreate,
@@ -70,7 +72,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.3.0",
+        version="1.4.0",
         description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消与一次性开场码领取/核销",
         lifespan=lifespan,
     )
@@ -78,10 +80,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.exception_handler(ConflictError)
     async def _conflict_handler(request: Request, exc: ConflictError):
-        return JSONResponse(
-            status_code=409,
-            content={"detail": str(exc), "code": "CONFLICT", "existing": exc.existing},
-        )
+        content = {"detail": str(exc), "code": "CONFLICT", "existing": exc.existing}
+        if exc.index is not None:
+            content["index"] = exc.index
+        return JSONResponse(status_code=409, content=content)
 
     @app.exception_handler(NotFoundError)
     async def _not_found_handler(request: Request, exc: NotFoundError):
@@ -104,7 +106,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.3.0",
+            "version": "1.4.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -248,6 +250,41 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             start_time=body.start_time,
             idempotency_key=body.idempotency_key,
         )
+
+    @app.post(
+        "/verifications/batch",
+        response_model=BatchVerifyResponse,
+        tags=["verifications"],
+    )
+    def verify_screening_batch(body: BatchVerifyRequest):
+        """发行方集中提交一批（1～100 个）场次，按输入顺序在一次请求内核验。
+
+        - 每项沿用单场核验的全部规则（授权选择、共享池、限时暂停、撤销、
+          幂等）；严格按顺序处理，**前项消耗的额度/池额度影响后项**，业务
+          拒绝同样落一条可追溯流水并继续处理后续项；
+        - 同批或历史中同幂等键且内容一致：返回原流水（replay=true），
+          **不重复扣额**；同键但内容不一致：**整批失败 409**（响应带
+          ``index`` 指出冲突项位置及 ``existing`` 原流水），整批回滚；
+        - 任一项格式错误（422，请求未进入处理）或处理中异常：**整批不留
+          下任何新流水，也不占用任何额度/池额度**；
+        - 整批在单个 ``BEGIN IMMEDIATE`` 事务内完成，与并发的单场核验、
+          取消完全串行：彼此只能看到整批之前或之后的完整状态，不会穿插
+          超额或重复释放；
+        - 响应 ``results`` 与输入同序，每项为完整单场核验结果并附
+          ``index``（输入位置，从 0 开始）。
+        """
+        results = store.verify_batch(
+            [
+                {
+                    "film_id": item.film_id,
+                    "venue_id": item.venue_id,
+                    "start_time": item.start_time,
+                    "idempotency_key": item.idempotency_key,
+                }
+                for item in body.items
+            ]
+        )
+        return {"count": len(results), "results": results}
 
     @app.get("/verifications", response_model=list[VerificationOut], tags=["verifications"])
     def list_verifications(

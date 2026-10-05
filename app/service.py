@@ -113,9 +113,12 @@ LEFT JOIN cancellations c ON c.verification_id = v.id
 class ConflictError(Exception):
     """409 — e.g. idempotency key reused with a different payload."""
 
-    def __init__(self, message: str, existing: Optional[dict] = None):
+    def __init__(self, message: str, existing: Optional[dict] = None,
+                 index: Optional[int] = None):
         super().__init__(message)
         self.existing = existing
+        # 批量核验时指出发生冲突的输入位置（从 0 开始）；单场核验为 None
+        self.index = index
 
 
 class NotFoundError(Exception):
@@ -706,97 +709,173 @@ class Store:
         serialised by SQLite and neither license quotas nor pool caps
         can ever be exceeded.
         """
-        start_iso = to_iso(start_time)
-        request_hash = _hash_request(film_id, venue_id, start_iso)
         with self._connection() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
-
-                existing = conn.execute(
-                    _VERIFICATION_SELECT + " WHERE v.idempotency_key = ?",
-                    (idempotency_key,),
-                ).fetchone()
-                if existing is not None:
-                    conn.execute("COMMIT")
-                    if existing["request_hash"] != request_hash:
-                        raise ConflictError(
-                            "idempotency key "
-                            f"'{idempotency_key}' was already used with a "
-                            "different request payload",
-                            existing=_verification_out(existing, replay=True),
-                        )
-                    return _verification_out(existing, replay=True)
-
-                candidates = conn.execute(
-                    _LICENSE_SELECT + """
-                    WHERE l.film_id = ? AND l.venue_id = ?
-                    ORDER BY l.valid_to ASC, l.id ASC
-                    """,
-                    (film_id, venue_id),
-                ).fetchall()
-
-                # Suspensions are read inside the same IMMEDIATE transaction
-                # as the decision, so an insert concurrent with this verify
-                # either commits before the transaction starts (fully visible)
-                # or waits until it ends (fully absent).  Half-open union:
-                # the slot is covered when suspend_from <= t < suspend_to.
-                suspended_ids: set = set()
-                if candidates:
-                    placeholders = ",".join("?" for _ in candidates)
-                    hit_rows = conn.execute(
-                        f"""
-                        SELECT DISTINCT license_id FROM suspensions
-                        WHERE license_id IN ({placeholders})
-                          AND suspend_from <= ? AND ? < suspend_to
-                        """,
-                        [c["id"] for c in candidates] + [start_iso, start_iso],
-                    ).fetchall()
-                    suspended_ids = {row["license_id"] for row in hit_rows}
-
-                (
-                    decision, license_id, pool_id, reason,
-                    remaining, pool_remaining,
-                ) = _decide(candidates, start_iso, suspended_ids)
-
-                created_at = now_iso()
-                cur = conn.execute(
-                    """
-                    INSERT INTO verifications
-                        (idempotency_key, request_hash, film_id, venue_id, start_time,
-                         decision, license_id, pool_id, reject_reason,
-                         remaining_quota, pool_remaining_quota, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (idempotency_key, request_hash, film_id, venue_id, start_iso,
-                     decision, license_id, pool_id, reason,
-                     remaining, pool_remaining, created_at),
+                result = self._verify_one(
+                    conn,
+                    film_id=film_id,
+                    venue_id=venue_id,
+                    start_time=start_time,
+                    idempotency_key=idempotency_key,
                 )
                 conn.execute("COMMIT")
-                return {
-                    "id": cur.lastrowid,
-                    "idempotency_key": idempotency_key,
-                    "film_id": film_id,
-                    "venue_id": venue_id,
-                    "start_time": start_iso,
-                    "decision": decision,
-                    "license_id": license_id,
-                    "pool_id": pool_id,
-                    "reject_reason": reason,
-                    "remaining_quota": remaining,
-                    "pool_remaining_quota": pool_remaining,
-                    "verified_at": created_at,
-                    "replay": False,
-                    "cancelled": False,
-                    "cancellation": None,
-                }
-            except ConflictError:
-                raise
+                return result
             except Exception:
                 try:
                     conn.execute("ROLLBACK")
                 except sqlite3.Error:
                     pass
                 raise
+
+    def verify_batch(self, items: list[dict]) -> list[dict]:
+        """Verify 1–100 screening requests atomically, in input order.
+
+        Each item reuses the exact single-screening rules
+        (:meth:`_verify_one`): authorisation selection, shared pools,
+        suspensions, revocation and idempotency. Items are processed
+        strictly in order, so an approval (including a business rejection
+        row, which is also a persisted trace) of an earlier item changes
+        the quota and pool usage seen by every later item; rejected
+        requests still leave their traceable flow row and processing
+        continues.
+
+        Every item runs inside **one** ``BEGIN IMMEDIATE`` transaction:
+        the whole batch either commits or rolls back. A key reused with
+        the same payload (whether inside this batch or from history)
+        replays the stored row (``replay=true``) and never consumes quota
+        again; a key reused with a different payload aborts the batch
+        with :class:`ConflictError` (carrying the offending ``index``),
+        as does any processing exception — no new flow rows and no quota
+        or pool usage survive. The single write lock additionally makes
+        the batch indivisible relative to concurrent single-screening
+        verifications and cancellations: they can observe only the
+        complete before-batch or complete after-batch state and can
+        never interleave into an overshoot.
+        """
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                results: list[dict] = []
+                for index, item in enumerate(items):
+                    try:
+                        result = self._verify_one(
+                            conn,
+                            film_id=item["film_id"],
+                            venue_id=item["venue_id"],
+                            start_time=item["start_time"],
+                            idempotency_key=item["idempotency_key"],
+                        )
+                    except ConflictError as exc:
+                        # 标出冲突项的输入位置；整批随之外层回滚
+                        exc.index = index
+                        raise
+                    result["index"] = index
+                    results.append(result)
+                conn.execute("COMMIT")
+                return results
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def _verify_one(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        film_id: str,
+        venue_id: str,
+        start_time: datetime,
+        idempotency_key: str,
+    ) -> dict:
+        """Idempotent verification for one item, on an open IMMEDIATE txn.
+
+        Used by both the single-screening endpoint (one item per
+        transaction) and the batch endpoint (many items in one
+        transaction). Never commits or rolls back — the caller owns the
+        transaction boundary; raises :class:`ConflictError` when the
+        idempotency key was previously stored with another payload.
+        """
+        start_iso = to_iso(start_time)
+        request_hash = _hash_request(film_id, venue_id, start_iso)
+
+        existing = conn.execute(
+            _VERIFICATION_SELECT + " WHERE v.idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_hash"] != request_hash:
+                raise ConflictError(
+                    "idempotency key "
+                    f"'{idempotency_key}' was already used with a "
+                    "different request payload",
+                    existing=_verification_out(existing, replay=True),
+                )
+            return _verification_out(existing, replay=True)
+
+        candidates = conn.execute(
+            _LICENSE_SELECT + """
+            WHERE l.film_id = ? AND l.venue_id = ?
+            ORDER BY l.valid_to ASC, l.id ASC
+            """,
+            (film_id, venue_id),
+        ).fetchall()
+
+        # Suspensions are read inside the same IMMEDIATE transaction
+        # as the decision, so an insert concurrent with this verify
+        # either commits before the transaction starts (fully visible)
+        # or waits until it ends (fully absent).  Half-open union:
+        # the slot is covered when suspend_from <= t < suspend_to.
+        suspended_ids: set = set()
+        if candidates:
+            placeholders = ",".join("?" for _ in candidates)
+            hit_rows = conn.execute(
+                f"""
+                SELECT DISTINCT license_id FROM suspensions
+                WHERE license_id IN ({placeholders})
+                  AND suspend_from <= ? AND ? < suspend_to
+                """,
+                [c["id"] for c in candidates] + [start_iso, start_iso],
+            ).fetchall()
+            suspended_ids = {row["license_id"] for row in hit_rows}
+
+        (
+            decision, license_id, pool_id, reason,
+            remaining, pool_remaining,
+        ) = _decide(candidates, start_iso, suspended_ids)
+
+        created_at = now_iso()
+        cur = conn.execute(
+            """
+            INSERT INTO verifications
+                (idempotency_key, request_hash, film_id, venue_id, start_time,
+                 decision, license_id, pool_id, reject_reason,
+                 remaining_quota, pool_remaining_quota, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (idempotency_key, request_hash, film_id, venue_id, start_iso,
+             decision, license_id, pool_id, reason,
+             remaining, pool_remaining, created_at),
+        )
+        return {
+            "id": cur.lastrowid,
+            "idempotency_key": idempotency_key,
+            "film_id": film_id,
+            "venue_id": venue_id,
+            "start_time": start_iso,
+            "decision": decision,
+            "license_id": license_id,
+            "pool_id": pool_id,
+            "reject_reason": reason,
+            "remaining_quota": remaining,
+            "pool_remaining_quota": pool_remaining,
+            "verified_at": created_at,
+            "replay": False,
+            "cancelled": False,
+            "cancellation": None,
+        }
 
     def get_verification(self, idempotency_key: str) -> dict:
         with self._connection() as conn:
