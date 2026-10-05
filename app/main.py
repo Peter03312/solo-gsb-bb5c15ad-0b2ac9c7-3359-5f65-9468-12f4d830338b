@@ -11,6 +11,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .schemas import (
+    BatchVerifyRequest,
+    BatchVerifyResponse,
     CancelOut,
     CancelRequest,
     LicenseCreate,
@@ -70,18 +72,18 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.3.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消与一次性开场码领取/核销",
+        version="1.4.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验（单场/批量）、额度控制、撤销追溯、已核准场次取消与一次性开场码领取/核销",
         lifespan=lifespan,
     )
     app.state.store = store
 
     @app.exception_handler(ConflictError)
     async def _conflict_handler(request: Request, exc: ConflictError):
-        return JSONResponse(
-            status_code=409,
-            content={"detail": str(exc), "code": "CONFLICT", "existing": exc.existing},
-        )
+        body = {"detail": str(exc), "code": "CONFLICT", "existing": exc.existing}
+        if exc.index is not None:
+            body["index"] = exc.index
+        return JSONResponse(status_code=409, content=body)
 
     @app.exception_handler(NotFoundError)
     async def _not_found_handler(request: Request, exc: NotFoundError):
@@ -104,7 +106,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.3.0",
+            "version": "1.4.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -230,6 +232,41 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ------------------------------------------------------------------
     # verifications
     # ------------------------------------------------------------------
+    @app.post(
+        "/verifications/batch",
+        response_model=BatchVerifyResponse,
+        tags=["verifications"],
+    )
+    def verify_screenings_batch(body: BatchVerifyRequest):
+        """一次性按顺序核验 1～100 个场次（整批原子、逐项沿用单场规则）。
+
+        - 处理严格按 ``items`` 输入顺序进行，响应 ``results`` 同序返回，
+          每项带其在数组中的下标 ``index``（从 0 开始）；
+        - 每项沿用单场核验的授权选择、共享池、限时暂停、撤销与幂等规则；
+          前项核准消耗的额度/池余量直接影响后项判定，业务拒绝（如
+          ``QUOTA_EXHAUSTED``）同样落为可追溯流水，不中断后续项；
+        - 幂等：同批或历史中同键且同内容（影片、场馆、开始时间）返回原流水
+          （``replay=true``），不重复扣额、不重复占池；**同键不同内容**使
+          整批失败（409，响应附 ``index`` 与 ``existing``）；
+        - 整批在单个 ``BEGIN IMMEDIATE`` 事务内完成：任一项同键冲突或处理
+          异常都整体回滚，**不留下任何新流水或额度占用**；批次与并发的
+          单场核验、取消由同一把写锁串行化，前后状态完整、绝不穿插超额；
+        - 单项字段格式错误（如 ``items`` 长度越界、单项时间无法解析）在入口
+          校验阶段返回 422（错误位置标注具体下标），同样不产生任何流水。
+        """
+        results = store.verify_batch(
+            [
+                {
+                    "film_id": item.film_id,
+                    "venue_id": item.venue_id,
+                    "start_time": item.start_time,
+                    "idempotency_key": item.idempotency_key,
+                }
+                for item in body.items
+            ]
+        )
+        return {"count": len(results), "results": results}
+
     @app.post("/verifications", response_model=VerificationOut, tags=["verifications"])
     def verify_screening(body: VerifyRequest):
         """核验一个待放映场次（幂等）。

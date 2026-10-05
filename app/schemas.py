@@ -142,6 +142,16 @@ class VerifyRequest(BaseModel):
     )
 
 
+class BatchVerifyRequest(BaseModel):
+    """发行方集中提交的一批待核验场次：按输入顺序处理 1～100 项。"""
+
+    items: list[VerifyRequest] = Field(
+        min_length=1,
+        max_length=100,
+        description="待核验场次列表，长度 1～100；按数组顺序逐项核验，响应结果同序返回",
+    )
+
+
 class CancellationOut(BaseModel):
     reason: str
     cancelled_at: str
@@ -171,6 +181,25 @@ class VerificationOut(BaseModel):
     cancelled: bool = Field(description="该流水是否已登记场次取消")
     cancellation: Optional[CancellationOut] = Field(
         description="取消详情（原因与取消时间）；未取消为 null"
+    )
+
+
+class BatchVerificationOut(VerificationOut):
+    """批量核验中的单项结果：原单场核验结果 + 该项在请求数组中的下标。"""
+
+    index: int = Field(
+        ge=0,
+        le=99,
+        description="该项在批量请求 items 数组中的下标（从 0 开始，与输入位置一一对应）",
+    )
+
+
+class BatchVerifyResponse(BaseModel):
+    """批量核验整批成功响应：结果按输入顺序排列。"""
+
+    count: int = Field(ge=1, le=100, description="本批处理的场次数（= items 长度）")
+    results: list[BatchVerificationOut] = Field(
+        description="每项现有核验结果，顺序与 items 完全一致"
     )
 
 
